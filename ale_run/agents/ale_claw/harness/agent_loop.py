@@ -109,6 +109,7 @@ class OpenClawComputerAgent(ComputerAgent):
         thinking_config: Optional[Any] = None,
         resolved_model: ResolvedModel | None = None,
         summary_runtime: ResolvedModel | None = None,
+        summary_use_main_connection: bool | None = None,
         registry: SubagentRegistry | None = None,
         auto_screenshot: bool = False,
         context_files: Optional[List[ContextFile]] = None,
@@ -178,6 +179,7 @@ class OpenClawComputerAgent(ComputerAgent):
         self.thinking_config = thinking_config
         self.resolved_model = resolved_model
         self.summary_runtime = summary_runtime
+        self.summary_use_main_connection = summary_use_main_connection
         self._helper_api_key: Optional[str] = None
         self._helper_api_base: Optional[str] = None
         self._registry = registry
@@ -387,8 +389,11 @@ class OpenClawComputerAgent(ComputerAgent):
             merged_kwargs["api_key"] = api_key if api_key is not None else self.api_key
         if (api_base is not None) or (self.api_base is not None):
             merged_kwargs["api_base"] = api_base if api_base is not None else self.api_base
-        self._helper_api_key = merged_kwargs.get("api_key")
-        self._helper_api_base = merged_kwargs.get("api_base")
+        inherit_connection = self.summary_use_main_connection
+        if inherit_connection is None:
+            inherit_connection = self.summary_model == self.model
+        self._helper_api_key = merged_kwargs.get("api_key") if inherit_connection else None
+        self._helper_api_base = merged_kwargs.get("api_base") if inherit_connection else None
 
         items = self._process_input(messages)
 

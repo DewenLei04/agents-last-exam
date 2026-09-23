@@ -5,11 +5,9 @@ Standalone config (no shared base). Declares ``model`` / ``max_turns``
 below. The episode wall-budget is orchestration-owned, so this config no
 longer carries ``timeout_s``.
 
-**API keys live in the operator's shell env**, not in this config. The
-deployer never touches ``os.environ`` — litellm (the harness's LLM
-client) reads ``OPENROUTER_API_KEY`` / ``ANTHROPIC_API_KEY`` /
-``OPENAI_API_KEY`` directly from the process's env vars, which the
-operator populates via shell ``source`` of an ``.env`` / ``.envrc``.
+API keys can be passed through ``api_key`` or read by LiteLLM from the
+operator's process environment (``OPENROUTER_API_KEY``, ``ANTHROPIC_API_KEY``,
+or ``OPENAI_API_KEY``). The deployer does not mutate ``os.environ``.
 For docker / VM runtimes those vars are propagated by
 :mod:`ale.runtime._env`.
 
@@ -73,6 +71,15 @@ class AleClawConfig:
     summary_model: str | None = None
     """Model for compaction + memory_flush. None → ``auxiliary_model`` if set,
     else ``model``. Cheaper sibling for cost savings."""
+
+    summary_use_main_connection: bool | None = None
+    """Connection inheritance for main-agent compaction and memory flush.
+    True passes the main run's explicit api_base/api_key to both helpers.
+    False omits them, leaving connection resolution to LiteLLM's environment
+    and defaults. None inherits only when the effective summary model string
+    equals the main model string. Set True for different models on a shared
+    gateway, or False for the same model on an independent connection.
+    """
 
     gui_model: str | None = None
     """Model for the ``delegate_gui`` subagent. None → ``auxiliary_model``
@@ -168,6 +175,10 @@ class AleClawConfig:
     by count). OpenClaw mode reduces cache thrash on multi-screenshot turns."""
 
     def __post_init__(self) -> None:
+        if self.summary_use_main_connection is not None and not isinstance(
+            self.summary_use_main_connection, bool
+        ):
+            raise ValueError("summary_use_main_connection must be true, false, or null")
         if self.disable_main_computer and self.disable_delegate_gui:
             raise ValueError(
                 "Both disable_main_computer and disable_delegate_gui set — "

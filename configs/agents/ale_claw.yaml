@@ -52,8 +52,14 @@ config:
   gui_transport: null
 
   # ---- model variants ----
-  # Model for compaction + memory_flush. null → lightweight_model if set, else model.
+  # Model for compaction + memory_flush. null → auxiliary_model if set, else model.
   summary_model: null
+  # Main-agent compaction and memory_flush connection inheritance:
+  # null: inherit main base_url/api_key only when the effective model names match.
+  # true: inherit even for a different model (e.g. a smaller model on the same gateway).
+  # false: let LiteLLM use its own environment/defaults, even for the same model.
+  # Independent helpers require their own valid LiteLLM connection configuration.
+  summary_use_main_connection: null
   # Model for the delegate_gui subagent. null → lightweight_model if set, else main.
   gui_model: null
   # Optional cheap-sibling model exposed to delegate tools (no auto-magic lookup).

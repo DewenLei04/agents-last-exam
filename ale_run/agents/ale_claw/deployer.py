@@ -348,6 +348,7 @@ class AleClawDeployer(BaseAgentDeployer):
             thinking_config=thinking_config,
             resolved_model=resolved_model,
             summary_runtime=resolved_summary_model,
+            summary_use_main_connection=cfg.summary_use_main_connection,
             registry=registry,
             **thinking_api_params,
         )
