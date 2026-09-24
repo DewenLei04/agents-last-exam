@@ -72,13 +72,22 @@ class AleClawConfig:
     """Model for compaction + memory_flush. None → ``auxiliary_model`` if set,
     else ``model``. Cheaper sibling for cost savings."""
 
+    summary_base_url: str | None = None
+    """Optional endpoint for main-agent compaction and memory flush. When set,
+    passed directly as LiteLLM's ``api_base`` without changing the process
+    environment."""
+
+    summary_api_key: str | None = None
+    """Optional credential for ``summary_base_url``. Prefer resolving it from
+    a per-task environment variable in the agent YAML."""
+
     summary_use_main_connection: bool | None = None
     """Connection inheritance for main-agent compaction and memory flush.
     True passes the main run's explicit api_base/api_key to both helpers.
-    False omits them, leaving connection resolution to LiteLLM's environment
-    and defaults. None inherits only when the effective summary model string
-    equals the main model string. Set True for different models on a shared
-    gateway, or False for the same model on an independent connection.
+    False uses summary_base_url/summary_api_key if supplied, otherwise LiteLLM's
+    environment and defaults. None uses explicit summary settings first,
+    otherwise inherits when the model strings match. Different models on the
+    same provider with an explicit main connection require an explicit choice.
     """
 
     gui_model: str | None = None
@@ -179,6 +188,13 @@ class AleClawConfig:
             self.summary_use_main_connection, bool
         ):
             raise ValueError("summary_use_main_connection must be true, false, or null")
+        if self.summary_use_main_connection is True and (
+            self.summary_base_url is not None or self.summary_api_key is not None
+        ):
+            raise ValueError(
+                "summary_use_main_connection=true cannot be combined with "
+                "summary_base_url or summary_api_key"
+            )
         if self.disable_main_computer and self.disable_delegate_gui:
             raise ValueError(
                 "Both disable_main_computer and disable_delegate_gui set — "

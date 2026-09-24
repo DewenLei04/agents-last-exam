@@ -109,6 +109,8 @@ class OpenClawComputerAgent(ComputerAgent):
         thinking_config: Optional[Any] = None,
         resolved_model: ResolvedModel | None = None,
         summary_runtime: ResolvedModel | None = None,
+        summary_base_url: str | None = None,
+        summary_api_key: str | None = None,
         summary_use_main_connection: bool | None = None,
         registry: SubagentRegistry | None = None,
         auto_screenshot: bool = False,
@@ -179,6 +181,8 @@ class OpenClawComputerAgent(ComputerAgent):
         self.thinking_config = thinking_config
         self.resolved_model = resolved_model
         self.summary_runtime = summary_runtime
+        self.summary_base_url = summary_base_url
+        self.summary_api_key = summary_api_key
         self.summary_use_main_connection = summary_use_main_connection
         self._helper_api_key: Optional[str] = None
         self._helper_api_base: Optional[str] = None
@@ -389,11 +393,43 @@ class OpenClawComputerAgent(ComputerAgent):
             merged_kwargs["api_key"] = api_key if api_key is not None else self.api_key
         if (api_base is not None) or (self.api_base is not None):
             merged_kwargs["api_base"] = api_base if api_base is not None else self.api_base
+        self._helper_api_key = None
+        self._helper_api_base = None
         inherit_connection = self.summary_use_main_connection
         if inherit_connection is None:
-            inherit_connection = self.summary_model == self.model
-        self._helper_api_key = merged_kwargs.get("api_key") if inherit_connection else None
-        self._helper_api_base = merged_kwargs.get("api_base") if inherit_connection else None
+            if self.summary_api_key is not None or self.summary_base_url is not None:
+                inherit_connection = False
+            elif self.summary_model == self.model:
+                inherit_connection = True
+            else:
+                main_provider = self.model.split("/", 1)[0] if "/" in self.model else None
+                summary_provider = (
+                    self.summary_model.split("/", 1)[0]
+                    if "/" in self.summary_model
+                    else None
+                )
+                main_connection_is_explicit = (
+                    merged_kwargs.get("api_key") is not None
+                    or merged_kwargs.get("api_base") is not None
+                )
+                if main_connection_is_explicit and (
+                    main_provider is None
+                    or summary_provider is None
+                    or main_provider == summary_provider
+                ):
+                    raise ValueError(
+                        "Cannot infer the summary connection for a different model "
+                        "on the same or an unknown provider. Set "
+                        "summary_use_main_connection to true or false, or configure "
+                        "summary_base_url/summary_api_key."
+                    )
+                inherit_connection = False
+        if inherit_connection:
+            self._helper_api_key = merged_kwargs.get("api_key")
+            self._helper_api_base = merged_kwargs.get("api_base")
+        else:
+            self._helper_api_key = self.summary_api_key
+            self._helper_api_base = self.summary_base_url
 
         items = self._process_input(messages)
 

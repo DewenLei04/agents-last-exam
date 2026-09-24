@@ -54,16 +54,21 @@ config:
   # ---- model variants ----
   # Model for compaction + memory_flush. null → auxiliary_model if set, else model.
   summary_model: null
+  # Optional independent summary endpoint and credential. Resolve the key from
+  # an environment variable, e.g. summary_api_key: ${env:SUMMARY_API_KEY}.
+  summary_base_url: null
+  summary_api_key: null
   # Main-agent compaction and memory_flush connection inheritance:
-  # null: inherit main base_url/api_key only when the effective model names match.
+  # null: use explicit summary settings; otherwise inherit for the same model.
+  #   With different models on the same provider and an explicit main connection,
+  #   choose true or false so the helper cannot silently use the wrong endpoint.
   # true: inherit even for a different model (e.g. a smaller model on the same gateway).
-  # false: let LiteLLM use its own environment/defaults, even for the same model.
-  # Independent helpers require their own valid LiteLLM connection configuration.
+  # false: use summary settings or LiteLLM's environment/defaults.
   summary_use_main_connection: null
-  # Model for the delegate_gui subagent. null → lightweight_model if set, else main.
+  # Model for the delegate_gui subagent. null → auxiliary_model if set, else main.
   gui_model: null
   # Optional cheap-sibling model exposed to delegate tools (no auto-magic lookup).
-  lightweight_model: null
+  auxiliary_model: null
 
   # ---- loop control ----
   # Truncate replay-message history when restoring a transcript. null = unlimited.

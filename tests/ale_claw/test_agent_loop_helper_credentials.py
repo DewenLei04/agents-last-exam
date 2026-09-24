@@ -3,10 +3,12 @@
 import asyncio
 import os
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
 
 from ale_run.agents.ale_claw import deployer as deployer_module
 from ale_run.agents.ale_claw.config import AleClawConfig
@@ -28,6 +30,8 @@ def configured_agent(tmp_path):
     agent.model = "openai/gpt-5.4"
     agent.summary_model = agent.model
     agent.summary_runtime = None
+    agent.summary_base_url = None
+    agent.summary_api_key = None
     agent.summary_use_main_connection = None
     agent.api_key = None
     agent.api_base = None
@@ -73,6 +77,36 @@ def test_config_factory_preserves_connection_option(inherit):
     assert cfg.summary_use_main_connection is inherit
 
 
+def test_config_factory_preserves_independent_summary_connection():
+    cfg = build_config(
+        AleClawConfig,
+        {
+            "summary_base_url": "https://summary.example/v1",
+            "summary_api_key": "summary-key",
+        },
+    )
+    assert cfg.summary_base_url == "https://summary.example/v1"
+    assert cfg.summary_api_key == "summary-key"
+
+
+def test_sample_config_uses_supported_auxiliary_model_field():
+    path = Path(__file__).resolve().parents[2] / "configs/agents/ale_claw.yaml"
+    options = yaml.safe_load(path.read_text())["config"]
+    assert "auxiliary_model" in options
+    assert "lightweight_model" not in options
+    cfg = build_config(AleClawConfig, options)
+    assert cfg.auxiliary_model is None
+
+
+@pytest.mark.parametrize("field", ["summary_base_url", "summary_api_key"])
+def test_config_rejects_conflicting_summary_connections(field):
+    with pytest.raises(ValueError, match="cannot be combined"):
+        build_config(
+            AleClawConfig,
+            {"summary_use_main_connection": True, field: "configured"},
+        )
+
+
 @pytest.mark.parametrize("invalid", ["false", "true", 0, 1])
 def test_config_rejects_non_boolean_connection_option(invalid):
     with pytest.raises(ValueError, match="summary_use_main_connection"):
@@ -89,9 +123,15 @@ def test_constructor_consumes_connection_option(inherit):
             session_mgr=MagicMock(),
             memory_store=MagicMock(),
             summary_model="openai/gpt-5.4",
+            summary_base_url=None if inherit else "https://summary.example/v1",
+            summary_api_key=None if inherit else "summary-key",
             summary_use_main_connection=inherit,
         )
+    assert agent.summary_base_url == (None if inherit else "https://summary.example/v1")
+    assert agent.summary_api_key == (None if inherit else "summary-key")
     assert agent.summary_use_main_connection is inherit
+    assert "summary_base_url" not in parent.call_args.kwargs
+    assert "summary_api_key" not in parent.call_args.kwargs
     assert "summary_use_main_connection" not in parent.call_args.kwargs
 
 
@@ -104,6 +144,64 @@ def test_repeated_runs_clear_stale_credentials(configured_agent, second_key, sec
     asyncio.run(agent._run_setup([], False, second_key, second_base, {}))
     assert agent._helper_api_key == second_key
     assert agent._helper_api_base == second_base
+
+
+@pytest.mark.parametrize(
+    "main_model,summary_model",
+    [
+        ("openai/main-model", "openai/summary-model"),
+        ("main-model", "openai/summary-model"),
+        ("openai/main-model", "summary-model"),
+    ],
+)
+def test_auto_requires_choice_for_ambiguous_connection(configured_agent, main_model, summary_model):
+    agent = configured_agent
+    agent.model = main_model
+    agent.summary_model = summary_model
+    agent._helper_api_key = "stale-key"
+    agent._helper_api_base = "https://stale.example/v1"
+    with pytest.raises(ValueError, match="Cannot infer the summary connection"):
+        asyncio.run(agent._run_setup([], False, "main-key", "https://main.example/v1", {}))
+    assert agent._helper_api_key is None
+    assert agent._helper_api_base is None
+    agent._process_input.assert_not_called()
+
+
+@pytest.mark.parametrize("inherit", [None, False])
+@pytest.mark.parametrize("summary_model", ["openai/gpt-5.4", "openai/summary-model"])
+@pytest.mark.parametrize("purpose", ["memory_flush", "compaction"])
+def test_independent_summary_connection_reaches_transport(
+    configured_agent, monkeypatch, inherit, summary_model, purpose
+):
+    agent = configured_agent
+    agent.summary_model = summary_model
+    agent.summary_use_main_connection = inherit
+    agent.summary_base_url = "https://summary.example/v1"
+    agent.summary_api_key = "summary-key"
+    monkeypatch.setenv("OPENAI_API_KEY", "environment-key")
+    asyncio.run(agent._run_setup([], False, "main-key", "https://main.example/v1", {}))
+    response = MagicMock()
+    response.choices = [SimpleNamespace(message=SimpleNamespace(content="Summary", tool_calls=[]))]
+    response.model_dump.return_value = {
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": "<silent>"}]}]
+    }
+    with (
+        patch("litellm.get_model_info", return_value={"max_input_tokens": 10000}),
+        patch("litellm.aresponses", new_callable=AsyncMock, return_value=response) as responses,
+        patch("litellm.acompletion", new_callable=AsyncMock, return_value=response) as chat,
+        patch.object(agent_loop, "should_run_memory_flush", return_value=True),
+    ):
+        if purpose == "memory_flush":
+            agent.session_mgr._state = object()
+            asyncio.run(agent._maybe_flush_memory())
+        else:
+            asyncio.run(agent._compact_in_place([], []))
+    calls = responses.await_args_list + chat.await_args_list
+    assert calls
+    for call in calls:
+        assert call.kwargs["model"] == summary_model
+        assert call.kwargs["api_key"] == "summary-key"
+        assert call.kwargs["api_base"] == "https://summary.example/v1"
 
 
 @pytest.mark.parametrize(
@@ -195,6 +293,8 @@ def test_deployer_wires_effective_summary_and_switch(
             "substrate_transport": "session",
             "disable_main_computer": True,
             "summary_use_main_connection": inherit,
+            "summary_base_url": None if inherit else "https://summary.example/v1",
+            "summary_api_key": None if inherit else "summary-key",
             **options,
         },
     )
@@ -225,6 +325,10 @@ def test_deployer_wires_effective_summary_and_switch(
     assert constructor.call_args.kwargs["summary_model"] == expected_model
     assert constructor.call_args.kwargs["summary_runtime"].model == expected_model
     assert constructor.call_args.kwargs["summary_use_main_connection"] is inherit
+    assert constructor.call_args.kwargs["summary_base_url"] == (
+        None if inherit else "https://summary.example/v1"
+    )
+    assert constructor.call_args.kwargs["summary_api_key"] == (None if inherit else "summary-key")
 
 
 class TestHelperCredentials:
@@ -238,6 +342,8 @@ class TestHelperCredentials:
         agent.kwargs = {}
         agent.model = "test-model"
         agent.summary_model = "test-model"
+        agent.summary_base_url = None
+        agent.summary_api_key = None
         agent.summary_use_main_connection = None
         agent.api_key = "default-key"
         agent.api_base = "http://default-endpoint/v1"
@@ -278,6 +384,8 @@ class TestHelperCredentials:
         agent.kwargs = {}
         agent.model = "openai/gpt-5.4"
         agent.summary_model = summary_model
+        agent.summary_base_url = None
+        agent.summary_api_key = None
         agent.summary_use_main_connection = inherit
         agent.api_key = None
         agent.api_base = None
