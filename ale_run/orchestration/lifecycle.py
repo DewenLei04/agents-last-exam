@@ -217,6 +217,21 @@ async def run_one_unit(
             task_meta = TaskLoader(str(task_path)).load(unit.variant_index)
             env_spec = _build_env_spec(task_meta, unit=unit)
             timeout_s = int(wall_time_s or task_meta.get("timeout_s") or _DEFAULT_TIMEOUT_S)
+            if artifacts is not None and artifacts.task_data_source.startswith("mounted:"):
+                from ..environments.task_data.mounted import REFERENCE_ARCHIVE_PASSWORD_ENV
+
+                if executor_type != "sandbox":
+                    raise ValueError(
+                        "mounted encrypted references require executor: sandbox; "
+                        "local runs in the host process, and docker mounts the host repository"
+                    )
+                import os
+
+                if not os.environ.get(REFERENCE_ARCHIVE_PASSWORD_ENV):
+                    raise ValueError(
+                        f"{REFERENCE_ARCHIVE_PASSWORD_ENV} is required before provisioning "
+                        "a sandbox with mounted task data"
+                    )
 
             # Resolve the provider for THIS task's snapshot (per-snapshot
             # routing: an environment can mix backends across snapshots).
@@ -988,6 +1003,8 @@ async def stage_reference(
                 source=report.get("source"),
             )
     except RuntimeError as e:
+        if source.startswith("mounted:"):
+            raise
         # Reference data is optional — many tasks don't have it.
         logger.info("Reference staging skipped (may not exist): %s", e)
         writer.emit_event("reference_stage_skipped", reason=str(e)[:200])

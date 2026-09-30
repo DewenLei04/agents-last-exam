@@ -23,7 +23,7 @@ proxy (aiohttp) on ``127.0.0.1:<random port>`` that injects the headers and
 pipes HTTP (incl. SSE streams) and WebSockets through. The handle's
 ``endpoint`` is that local URL; nothing else in the framework knows about HF.
 
-Requires ``huggingface_hub>=1.x`` and a HF token (``HF_TOKEN`` /
+Requires ``huggingface_hub>=1.24`` and a HF token (``HF_TOKEN`` /
 ``hf auth login``) with the ``jobs`` scope.
 """
 from __future__ import annotations
@@ -46,10 +46,36 @@ from ...base_interface import (
 
 logger = logging.getLogger(__name__)
 
+_CPU_FLAVORS = {
+    "cpu-basic": (2, 16),
+    "cpu-upgrade": (8, 32),
+    "cpu-xl": (16, 124),
+    "cpu-performance": (32, 256),
+}
+
+_ALE_UBUNTU_JOB_COMMAND = (
+    "/bin/bash", "-lc",
+    (
+        "set -eu; "
+        "sed 's/ -m computer_server --port 5000/"
+        " -m computer_server --host 0.0.0.0 --port 5000/' "
+        "/dockerstartup/entrypoint.sh > /tmp/ale-hf-entrypoint.sh; "
+        "grep -q 'computer_server --host 0.0.0.0 --port 5000' "
+        "/tmp/ale-hf-entrypoint.sh; "
+        "exec /bin/bash /tmp/ale-hf-entrypoint.sh"
+    ),
+)
+
 _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
 })
+
+
+def _entrypoint_command(container_ref: str, image: Any) -> list[str]:
+    if container_ref.startswith("agentslastexam/ale-ubuntu22-docker"):
+        return list(_ALE_UBUNTU_JOB_COMMAND)
+    return [image.docker_entrypoint]
 
 
 # ======================================================================
@@ -73,6 +99,11 @@ class HfSandboxProviderConfig:
     job_timeout: str = "24h"
     """(transport=job) Hard wall-clock cap on the sandbox job. The framework
     kills the job on ``release`` anyway; this is the safety net."""
+
+    job_command: tuple[str, ...] = ()
+    """Optional command override for HF Jobs. The published ALE Ubuntu image
+    uses a startup wrapper to expose cua-server; other images use their
+    declared Docker entrypoint."""
 
     flavor: str = "cpu-upgrade"
     """HF Jobs hardware flavor (``hf jobs hardware``). The ALE image wants
@@ -102,7 +133,8 @@ class HfSandboxProviderConfig:
     """Volumes to mount into every sandbox job, ``hf jobs run -v`` syntax:
     ``hf://buckets/<ns>/<name>[/<prefix>]:/<mount>[:ro|:rw]`` or
     ``hf://datasets/<ns>/<name>[/<prefix>]:/<mount>``. Pair a read-only bucket
-    holding the extracted ``ale-tasks-data.tar.gz`` with
+    holding input/, software/, encrypted reference.7z, and a reference.required
+    or reference.absent marker per variant (no plaintext reference/ directories) with
     ``task_data_source: mounted:/<mount>``."""
 
 
@@ -115,11 +147,19 @@ def _build_provider_config(raw: dict[str, Any]) -> HfSandboxProviderConfig:
     transport = str(raw.get("transport") or "job")
     if transport not in ("job", "sandbox"):
         raise ValueError(f"hfsandbox: transport must be 'job' or 'sandbox', got {transport!r}")
+    command = raw.get("job_command")
+    if command is not None and (
+        not isinstance(command, (list, tuple))
+        or not command
+        or not all(isinstance(arg, str) and arg for arg in command)
+    ):
+        raise ValueError("hfsandbox: job_command must be a non-empty list of strings")
     return HfSandboxProviderConfig(
         image=str(raw.get("image") or "ale-ubuntu22-docker"),
         image_ref=str(raw.get("image_ref") or ""),
         transport=transport,
         job_timeout=str(raw.get("job_timeout") or "24h"),
+        job_command=tuple(command or ()),
         flavor=str(raw.get("flavor") or "cpu-upgrade"),
         idle_timeout=raw.get("idle_timeout", 3600),
         start_timeout=float(raw.get("start_timeout") or 1800),
@@ -376,6 +416,7 @@ class HfSandboxProvider(Provider):
     async def acquire(self, spec: SandboxSpec) -> SandboxHandle:
         from ..images import get as get_image
 
+        self._validate_resources(spec)
         image = get_image(self._cfg.image)
         container_ref = self._cfg.image_ref or image.docker_image
         if not container_ref:
@@ -425,9 +466,14 @@ class HfSandboxProvider(Provider):
                 },
             )
             await self._wait_cua_ready(handle)
-        except Exception:
-            await proxy.stop()
-            await asyncio.to_thread(kill)
+        except BaseException:
+            try:
+                await proxy.stop()
+            finally:
+                try:
+                    await asyncio.shield(asyncio.to_thread(kill))
+                except Exception as cleanup_error:  # noqa: BLE001
+                    logger.error("hfsandbox: cleanup failed for %s: %s", remote_id, cleanup_error)
             raise
         self._live[remote_id] = _Live(proxy=proxy, kill=kill, sandbox=sbx)
         logger.info(
@@ -435,6 +481,27 @@ class HfSandboxProvider(Provider):
             remote_id, proxy.url, time.monotonic() - t0,
         )
         return handle
+
+    def _validate_resources(self, spec: SandboxSpec) -> None:
+        if spec.gpu or spec.snapshot.startswith("gpu-"):
+            raise ValueError("hfsandbox: this Ubuntu image supports CPU tasks only")
+        from .gcloud import _parse_gce_machine_type
+
+        shape = _parse_gce_machine_type(spec.machine_type) if spec.machine_type else None
+        required_cpus = max(spec.vcpus or 0, shape.vcpus if shape else 0)
+        required_memory = max(spec.memory_gb or 0, shape.memory_gb if shape else 0)
+        capacity = _CPU_FLAVORS.get(self._cfg.flavor)
+        if capacity is None:
+            raise ValueError(
+                f"hfsandbox: cannot validate flavor {self._cfg.flavor!r}; "
+                f"choose one of {sorted(_CPU_FLAVORS)}"
+            )
+        if required_cpus > capacity[0] or required_memory > capacity[1]:
+            raise ValueError(
+                f"hfsandbox: task {spec.task_id or spec.snapshot} requires "
+                f"{required_cpus} vCPU/{required_memory} GB, but {self._cfg.flavor} "
+                f"provides {capacity[0]} vCPU/{capacity[1]} GB; choose a larger flavor"
+            )
 
     async def _create_via_job(self, container_ref: str, image: Any, env: dict, spec: SandboxSpec):
         """HF Job running the image entrypoint as its command, port exposed."""
@@ -447,45 +514,85 @@ class HfSandboxProvider(Provider):
         # HF job label values must match ^[a-zA-Z0-9._-]*$ (task ids contain "/").
         safe_task = re.sub(r"[^a-zA-Z0-9._-]", "_", spec.task_id or "")[:60]
         labels = {"ale": "sandbox", "ale_task": safe_task}
-        job = await asyncio.to_thread(
-            api.run_job,
-            image=container_ref,
-            command=[image.docker_entrypoint],
-            env=env,
-            flavor=self._cfg.flavor,
-            timeout=self._cfg.job_timeout,
-            expose=[image.cua_server_port],
-            labels={k: v for k, v in labels.items() if v},
-            volumes=[parse_volume_spec(v) for v in self._cfg.volumes] or None,
-            namespace=self._cfg.namespace,
-        )
+        command = list(self._cfg.job_command) or _entrypoint_command(container_ref, image)
+        def cancel_job(job: Any) -> None:
+            for attempt in range(3):
+                try:
+                    api.cancel_job(job_id=job.id, namespace=job.owner.name)
+                    return
+                except Exception:
+                    if attempt == 2:
+                        raise
+                    time.sleep(attempt + 1)
+
+        creation_lock = threading.Lock()
+        created: dict[str, Any] = {"job": None, "abandoned": False}
+
+        def run_job() -> Any:
+            job = api.run_job(
+                image=container_ref,
+                command=command,
+                env=env,
+                flavor=self._cfg.flavor,
+                timeout=self._cfg.job_timeout,
+                expose=[image.cua_server_port],
+                labels={k: v for k, v in labels.items() if v},
+                volumes=[parse_volume_spec(v) for v in self._cfg.volumes] or None,
+                namespace=self._cfg.namespace,
+            )
+            with creation_lock:
+                abandoned = created["abandoned"]
+                if not abandoned:
+                    created["job"] = job
+            if abandoned:
+                try:
+                    cancel_job(job)
+                except Exception as cleanup_error:  # noqa: BLE001
+                    logger.error("hfsandbox: cleanup failed for %s: %s", job.id, cleanup_error)
+            return job
+
+        try:
+            job = await asyncio.to_thread(run_job)
+        except asyncio.CancelledError:
+            with creation_lock:
+                created["abandoned"] = True
+                job = created["job"]
+            if job is not None:
+                try:
+                    await asyncio.shield(asyncio.to_thread(cancel_job, job))
+                except Exception as cleanup_error:  # noqa: BLE001
+                    logger.error("hfsandbox: cleanup failed for %s: %s", job.id, cleanup_error)
+            raise
         job_id, owner = job.id, job.owner.name
 
         def kill() -> None:
-            try:
-                api.cancel_job(job_id=job_id, namespace=owner)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("hfsandbox: cancel_job %s failed: %s", job_id, e)
+            cancel_job(job)
 
-        deadline = time.monotonic() + self._cfg.start_timeout
-        url = None
-        while time.monotonic() < deadline:
-            info = await asyncio.to_thread(api.inspect_job, job_id=job_id, namespace=owner)
-            stage = info.status.stage
-            if stage == "RUNNING" and info.status.expose_urls:
-                url = info.status.expose_urls[0]
-                break
-            if stage in ("ERROR", "COMPLETED", "CANCELED", "DELETED"):
+        try:
+            deadline = time.monotonic() + self._cfg.start_timeout
+            url = None
+            while time.monotonic() < deadline:
+                info = await asyncio.to_thread(api.inspect_job, job_id=job_id, namespace=owner)
+                stage = info.status.stage
+                if stage == "RUNNING" and info.status.expose_urls:
+                    url = info.status.expose_urls[0]
+                    break
+                if stage in ("ERROR", "COMPLETED", "CANCELED", "DELETED"):
+                    raise RuntimeError(
+                        f"hfsandbox: job {job_id} ended during startup: {info.status}"
+                    )
+                await asyncio.sleep(3)
+            if url is None:
                 raise RuntimeError(
-                    f"hfsandbox: job {job_id} ended during startup: {info.status}"
+                    f"hfsandbox: job {job_id} not RUNNING after {self._cfg.start_timeout:.0f}s "
+                    f"(image pull of {container_ref} still in progress?)"
                 )
-            await asyncio.sleep(3)
-        if url is None:
-            await asyncio.to_thread(kill)
-            raise RuntimeError(
-                f"hfsandbox: job {job_id} not RUNNING after {self._cfg.start_timeout:.0f}s "
-                f"(image pull of {container_ref} still in progress?)"
-            )
+        except BaseException:
+            try:
+                await asyncio.shield(asyncio.to_thread(kill))
+            except Exception as cleanup_error:  # noqa: BLE001
+                logger.error("hfsandbox: cleanup failed for %s: %s", job_id, cleanup_error)
+            raise
         headers = {"Authorization": f"Bearer {token}"}
         return job_id, url, headers, kill, None, {"job_owner": owner}
 
@@ -505,20 +612,27 @@ class HfSandboxProvider(Provider):
         )
 
         def kill() -> None:
-            _kill_quiet(sbx)
+            try:
+                sbx.kill()
+            finally:
+                sbx.close()
 
         try:
             # The sandbox server replaced the container's own CMD, so start the
             # image entrypoint (X display + cua-server) ourselves, detached.
+            command = _entrypoint_command(container_ref, image)
             proc = await asyncio.to_thread(
-                sbx.run, [image.docker_entrypoint], shell=False, background=True,
+                sbx.run, command, shell=False, background=True,
             )
-        except Exception:
-            await asyncio.to_thread(kill)
+            upstream = sbx.proxy_url_for(image.cua_server_port, "/").rstrip("/")
+            extra = {"sandbox_id": sbx.id, "entrypoint_pid": getattr(proc, "pid", None)}
+            return sbx.id, upstream, dict(sbx.proxy_headers), kill, sbx, extra
+        except BaseException:
+            try:
+                await asyncio.shield(asyncio.to_thread(kill))
+            except Exception as cleanup_error:  # noqa: BLE001
+                logger.error("hfsandbox: sandbox cleanup failed for %s: %s", sbx.id, cleanup_error)
             raise
-        upstream = sbx.proxy_url_for(image.cua_server_port, "/").rstrip("/")
-        extra = {"sandbox_id": sbx.id, "entrypoint_pid": getattr(proc, "pid", None)}
-        return sbx.id, upstream, dict(sbx.proxy_headers), kill, sbx, extra
 
     async def _wait_cua_ready(self, handle: SandboxHandle) -> None:
         deadline = time.monotonic() + self._cfg.cua_ready_timeout
@@ -529,6 +643,21 @@ class HfSandboxProvider(Provider):
                 return
             except Exception as e:  # noqa: BLE001 — any failure means "not yet"
                 last = e
+                if (handle.metadata or {}).get("transport") == "job":
+                    from huggingface_hub import HfApi
+
+                    owner = (handle.metadata or {}).get("job_owner") or self._cfg.namespace
+                    try:
+                        info = await asyncio.to_thread(
+                            HfApi().inspect_job, job_id=handle.id, namespace=owner,
+                        )
+                    except Exception as inspect_error:  # noqa: BLE001
+                        logger.debug("hfsandbox: cannot inspect %s: %s", handle.id, inspect_error)
+                    else:
+                        if info.status.stage in ("ERROR", "COMPLETED", "CANCELED", "DELETED"):
+                            raise RuntimeError(
+                                f"hfsandbox: job {handle.id} ended before CUA ready: {info.status}"
+                            ) from e
                 await asyncio.sleep(3)
         raise RuntimeError(
             f"hfsandbox: cua-server in {handle.id} not ready after "
@@ -540,10 +669,11 @@ class HfSandboxProvider(Provider):
     async def release(
         self, sandbox: SandboxHandle, *, mode: ReleaseMode = "delete",
     ) -> None:
-        live = self._live.pop(sandbox.id, None)
-        if live is not None:
-            await live.proxy.stop()
+        live = self._live.get(sandbox.id)
         if mode == "keep":
+            if live is not None:
+                await live.proxy.stop()
+            self._live.pop(sandbox.id, None)
             logger.info(
                 "hfsandbox: keeping %s running; stop it with `hf jobs cancel %s`",
                 sandbox.id, sandbox.id,
@@ -551,12 +681,26 @@ class HfSandboxProvider(Provider):
             return
         # "stop" has no cheaper equivalent on HF Jobs (a stopped job still
         # bills), so both stop and delete cancel the job.
-        if live is not None:
-            await asyncio.to_thread(live.kill)
-        else:
-            from huggingface_hub import HfApi
-            owner = (sandbox.metadata or {}).get("job_owner") or self._cfg.namespace
-            await asyncio.to_thread(HfApi().cancel_job, job_id=sandbox.id, namespace=owner)
+        try:
+            if live is not None:
+                await live.proxy.stop()
+        finally:
+            if live is not None:
+                await asyncio.shield(asyncio.to_thread(live.kill))
+            else:
+                if (sandbox.metadata or {}).get("transport") == "sandbox":
+                    from huggingface_hub import Sandbox
+                    owner = self._cfg.namespace
+                    remote = await asyncio.to_thread(Sandbox.connect, sandbox.id, namespace=owner)
+                    try:
+                        await asyncio.to_thread(remote.kill)
+                    finally:
+                        await asyncio.to_thread(remote.close)
+                else:
+                    from huggingface_hub import HfApi
+                    owner = (sandbox.metadata or {}).get("job_owner") or self._cfg.namespace
+                    await asyncio.to_thread(HfApi().cancel_job, job_id=sandbox.id, namespace=owner)
+            self._live.pop(sandbox.id, None)
         logger.info("hfsandbox: cancelled %s", sandbox.id)
 
     def open_session(self, sandbox: SandboxHandle) -> Any:
@@ -567,12 +711,3 @@ class HfSandboxProvider(Provider):
         session = RemoteDesktopSession(api_url=sandbox.endpoint, os_type=sandbox.os)
         _init_computer_skip_wait(session)
         return session
-
-
-def _kill_quiet(sbx: Any) -> None:
-    try:
-        sbx.kill()
-    except Exception as e:  # noqa: BLE001
-        logger.warning("hfsandbox: kill failed for %s: %s", getattr(sbx, "id", "?"), e)
-    with contextlib.suppress(Exception):
-        sbx.close()

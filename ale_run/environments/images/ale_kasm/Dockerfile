@@ -127,7 +127,7 @@ RUN chown -R 1000:0 /home/kasm-user/.cache 2>/dev/null || true
 # ============================================================
 # 9. Startup script: upgrade CUA packages + start computer_server
 # ============================================================
-RUN echo -e "#!/bin/bash\nsudo uv pip install --upgrade --system cua-computer-server \"cua-agent[all]\"\n/usr/bin/python3 -m computer_server" > $STARTUPDIR/custom_startup.sh \
+RUN echo -e "#!/bin/bash\nsudo uv pip install --upgrade --system cua-computer-server \"cua-agent[all]\"\n/usr/bin/python3 -m computer_server --host 0.0.0.0" > $STARTUPDIR/custom_startup.sh \
     && chmod +x $STARTUPDIR/custom_startup.sh
 
 USER 1000

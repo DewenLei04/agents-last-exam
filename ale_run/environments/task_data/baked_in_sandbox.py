@@ -150,19 +150,30 @@ async def stage_reference(
     base = task_subdir(sandbox, task_data)
     archive = join(sandbox, base, "reference.7z")
     target = join(sandbox, base, "reference")
-    tmp = join(sandbox, base, ".reference_extract")
 
     if not await sandbox.exists(archive):
         return {"skipped": True, "reason": "no_reference_7z"}
 
-    password = os.environ.get(REFERENCE_ARCHIVE_PASSWORD_ENV)
+    await decrypt_reference_archive(
+        sandbox, archive=archive, target=target,
+        password_env=REFERENCE_ARCHIVE_PASSWORD_ENV,
+    )
+    return {"staged": ["reference"], "source": "baked_in_sandbox",
+            "decrypted_from": "reference.7z"}
+
+
+async def decrypt_reference_archive(
+    sandbox: SandboxHandle, *, archive: str, target: str, password_env: str,
+) -> None:
+    """Decrypt a reference archive after agent execution into the evaluator path."""
+    password = os.environ.get(password_env)
     if not password:
         raise ValueError(
-            f"{REFERENCE_ARCHIVE_PASSWORD_ENV} is required to decrypt "
-            "baked task reference data. Copy secret/.env.example to "
-            "secret/.env before running the experiment."
+            f"{password_env} is required to decrypt task reference data on the host"
         )
 
+    sep = "/" if sandbox.is_linux else "\\"
+    tmp = target.rsplit(sep, 1)[0] + sep + ".reference_extract"
     await sandbox.rm([target, tmp])
     await sandbox.mkdir(tmp)
 
@@ -179,7 +190,7 @@ async def stage_reference(
     r = await sandbox.run_command(cmd, timeout=300)
     if r.returncode != 0:
         await sandbox.rm([tmp])
-        raise RuntimeError(
+        raise ValueError(
             f"7z decrypt {archive} failed (rc={r.returncode}): "
             f"{(r.stderr or r.stdout or '')[:300]}"
         )
@@ -202,13 +213,11 @@ async def stage_reference(
     mr = await sandbox.run_command(mv_cmd, timeout=120)
     await sandbox.rm([tmp])
     if mr.returncode != 0:
-        raise RuntimeError(
+        raise ValueError(
             f"reference normalise move failed (rc={mr.returncode}): "
             f"{(mr.stderr or mr.stdout or '')[:300]}"
         )
-    logger.info("baked_in_sandbox: decrypted %s → %s", archive, target)
+    logger.info("reference archive decrypted %s → %s", archive, target)
     # Repair a vendored evaluator venv whose baked home points at a different
     # image's base Python (Windows; no-op otherwise / when home is valid).
     await _repoint_evaluator_venv_home(sandbox, target)
-    return {"staged": ["reference"], "source": "baked_in_sandbox",
-            "decrypted_from": "reference.7z"}

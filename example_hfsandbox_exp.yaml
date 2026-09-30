@@ -1,6 +1,9 @@
 # example_hfsandbox_exp.yaml — run the HF Sandboxes provider end to end.
-# Fill in the bucket in configs/environments/hfsandbox.yaml first (see that
-# file, or docs/ale-docs-site/pages/hf-sandbox.html), then:
+# Fill in the bucket in configs/environments/hfsandbox.yaml and set
+# HF_INFERENCE_TOKEN plus ALE_MOUNTED_REFERENCE_ARCHIVE_PASSWORD in secret/.env
+# first (see docs/ale-docs-site/pages/hf-sandbox.html), then:
+# The default cpu-upgrade flavor cannot run 3 of the 99 listed tasks; use
+# cpu-xl for the full list or exclude those tasks in a copied task list.
 #
 #     uv run python -m ale_run run example_hfsandbox_exp.yaml
 #     uv run python -m ale_run run example_hfsandbox_exp.yaml --dry-run

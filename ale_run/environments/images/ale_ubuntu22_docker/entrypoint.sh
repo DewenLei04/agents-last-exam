@@ -116,4 +116,4 @@ if [ "${ALE_DESKTOP:-1}" = "1" ] && command -v startxfce4 >/dev/null 2>&1; then
     xfconf-query -c xfwm4 -p /general/use_compositing -s false 2>/dev/null || true
   ) &
 fi
-exec /opt/cua-server/.venv/bin/python -m computer_server --port 5000
+exec /opt/cua-server/.venv/bin/python -m computer_server --host 0.0.0.0 --port 5000

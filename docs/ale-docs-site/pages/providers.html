@@ -66,8 +66,8 @@ uv sync --all-packages</code></pre>
         <tr>
           <td><a href="/pages/hf-sandbox.html"><strong>HF Sandboxes</strong></a><br><code>hfsandbox</code></td>
           <td>A fresh Hugging Face Job for every run unit</td>
-          <td>Same 99 tasks in <code>docker_support.txt</code></td>
-          <td>The same Linux subset without local Docker or a cloud account</td>
+          <td>CPU tasks in <code>docker_support.txt</code>, subject to flavor capacity</td>
+          <td>Remote Linux evaluation without local Docker</td>
         </tr>
         <tr>
           <td><a href="/pages/local.html"><strong>QEMU/KVM VMs</strong></a><br><code>qemu</code></td>
@@ -140,7 +140,7 @@ uv sync --all-packages</code></pre>
         <div class="d">A lighter local Linux sandbox with host-staged task data.</div>
       </a>
       <a class="card" href="/pages/hf-sandbox.html">
-        <div class="k">Supported</div>
+        <div class="k">Experimental</div>
         <div class="t">HF Sandboxes</div>
         <div class="d">Ephemeral HF Jobs; no local Docker or cloud account needed.</div>
       </a>

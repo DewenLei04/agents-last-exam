@@ -1,16 +1,23 @@
 """hfsandbox provider — the local auth-injecting proxy (HTTP, SSE, WebSocket)."""
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 aiohttp = pytest.importorskip("aiohttp")
 from aiohttp import web
 
+from ale_run.base_interface import SandboxSpec
 from ale_run.environments.providers.hfsandbox import (
+    HfSandboxProvider,
     _AuthProxy,
     _build_provider_config,
+    _Live,
     parse_volume_spec,
 )
 
@@ -99,6 +106,9 @@ def test_build_provider_config_defaults_and_overrides():
                                   "resolution": [800, 600], "namespace": "org"})
     assert (cfg.flavor, cfg.idle_timeout, cfg.resolution, cfg.namespace) == ("cpu-basic", "2h", (800, 600), "org")
     assert _build_provider_config({"transport": "sandbox"}).transport == "sandbox"
+    assert _build_provider_config({"job_command": ["python", "-V"]}).job_command == ("python", "-V")
+    with pytest.raises(ValueError, match="job_command"):
+        _build_provider_config({"job_command": "python -V"})
     with pytest.raises(ValueError):
         _build_provider_config({"transport": "docker"})
 
@@ -123,3 +133,161 @@ def test_parse_volume_spec():
             parse_volume_spec(bad)
     cfg = _build_provider_config({"volumes": ["hf://buckets/ns/data:/mnt/data:ro"]})
     assert cfg.volumes == ("hf://buckets/ns/data:/mnt/data:ro",)
+
+
+async def test_job_is_cancelled_when_startup_poll_fails():
+    class FakeApi:
+        def __init__(self):
+            self.cancelled = []
+            self.command = None
+
+        def run_job(self, **kwargs):
+            self.command = kwargs["command"]
+            return SimpleNamespace(id="job-1", owner=SimpleNamespace(name="owner"))
+
+        def inspect_job(self, **kwargs):
+            raise ConnectionError("temporary status failure")
+
+        def cancel_job(self, **kwargs):
+            self.cancelled.append(kwargs)
+
+    api = FakeApi()
+    image = SimpleNamespace(docker_entrypoint="/entry", cua_server_port=5000)
+    with patch("huggingface_hub.HfApi", return_value=api), patch(
+        "huggingface_hub.get_token", return_value="test-token"
+    ), pytest.raises(ConnectionError, match="temporary status failure"):
+        await HfSandboxProvider({"job_command": ["/bin/bash", "/entry"]})._create_via_job(
+            "image", image, {}, SandboxSpec(snapshot="cpu-free-ubuntu", task_id="demo")
+        )
+    assert api.cancelled == [{"job_id": "job-1", "namespace": "owner"}]
+    assert api.command == ["/bin/bash", "/entry"]
+
+
+async def test_published_ale_image_uses_reachable_entrypoint():
+    class FakeApi:
+        def run_job(self, **kwargs):
+            self.command = kwargs["command"]
+            return SimpleNamespace(id="job-1", owner=SimpleNamespace(name="owner"))
+
+        def inspect_job(self, **kwargs):
+            raise ConnectionError("stop after command check")
+
+        def cancel_job(self, **kwargs):
+            pass
+
+    api = FakeApi()
+    image = SimpleNamespace(docker_entrypoint="/dockerstartup/entrypoint.sh", cua_server_port=5000)
+    with patch("huggingface_hub.HfApi", return_value=api), patch(
+        "huggingface_hub.get_token", return_value="test-token"
+    ), pytest.raises(ConnectionError, match="stop after command check"):
+        await HfSandboxProvider({})._create_via_job(
+            "agentslastexam/ale-ubuntu22-docker:latest", image, {},
+            SandboxSpec(snapshot="cpu-free-ubuntu", task_id="demo"),
+        )
+    assert api.command[:2] == ["/bin/bash", "-lc"]
+    assert "--host 0.0.0.0 --port 5000" in api.command[2]
+
+
+async def test_cancel_during_job_creation_cancels_late_job():
+    started = threading.Event()
+    finish_creation = threading.Event()
+    cancelled = threading.Event()
+
+    class FakeApi:
+        def run_job(self, **kwargs):
+            started.set()
+            if not finish_creation.wait(5):
+                raise TimeoutError("test job creation stalled")
+            return SimpleNamespace(id="job-1", owner=SimpleNamespace(name="owner"))
+
+        def cancel_job(self, **kwargs):
+            assert kwargs == {"job_id": "job-1", "namespace": "owner"}
+            cancelled.set()
+
+    image = SimpleNamespace(docker_entrypoint="/entry", cua_server_port=5000)
+    with patch("huggingface_hub.HfApi", return_value=FakeApi()), patch(
+        "huggingface_hub.get_token", return_value="test-token"
+    ):
+        task = asyncio.create_task(HfSandboxProvider({})._create_via_job(
+            "image", image, {}, SandboxSpec(snapshot="cpu-free-ubuntu", task_id="demo")
+        ))
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            finish_creation.set()
+        assert await asyncio.to_thread(cancelled.wait, 5)
+
+
+async def test_cua_wait_stops_when_job_has_failed():
+    class Unreachable:
+        id = "job-1"
+
+        def __init__(self):
+            self.metadata = {"transport": "job", "job_owner": "owner"}
+
+        async def check_reachable(self, *, label):
+            raise ConnectionError("port unavailable")
+
+    class FakeApi:
+        def inspect_job(self, **kwargs):
+            assert kwargs == {"job_id": "job-1", "namespace": "owner"}
+            return SimpleNamespace(status=SimpleNamespace(stage="ERROR", message="exec format error"))
+
+    with patch("huggingface_hub.HfApi", return_value=FakeApi()), pytest.raises(
+        RuntimeError, match="ended before CUA ready"
+    ):
+        await HfSandboxProvider({"cua_ready_timeout": 120})._wait_cua_ready(Unreachable())
+
+
+def test_flavor_is_checked_before_creating_a_job():
+    provider = HfSandboxProvider({"flavor": "cpu-upgrade"})
+    provider._validate_resources(SandboxSpec(snapshot="cpu-free-ubuntu", vcpus=8, memory_gb=32))
+    with pytest.raises(ValueError, match="requires 16 vCPU"):
+        provider._validate_resources(
+            SandboxSpec(snapshot="cpu-free-ubuntu", vcpus=16, memory_gb=64)
+        )
+    with pytest.raises(ValueError, match="requires 16 vCPU"):
+        provider._validate_resources(
+            SandboxSpec(snapshot="cpu-free-ubuntu", machine_type="c4-standard-16")
+        )
+    HfSandboxProvider({"flavor": "cpu-xl"})._validate_resources(
+        SandboxSpec(snapshot="cpu-free-ubuntu", vcpus=16, memory_gb=64)
+    )
+    with pytest.raises(ValueError, match="CPU tasks only"):
+        provider._validate_resources(SandboxSpec(snapshot="gpu-free"))
+    with pytest.raises(ValueError, match="requires 16 vCPU"):
+        provider._validate_resources(
+            SandboxSpec(snapshot="cpu-free-ubuntu", machine_type="c4-standard-16", vcpus=4)
+        )
+
+
+async def test_release_cancels_job_even_if_proxy_stop_fails():
+    class BrokenProxy:
+        async def stop(self):
+            raise RuntimeError("proxy close failed")
+
+    cancelled = []
+    provider = HfSandboxProvider({})
+    provider._live["job-1"] = _Live(proxy=BrokenProxy(), kill=lambda: cancelled.append(True))
+    with pytest.raises(RuntimeError, match="proxy close failed"):
+        await provider.release(SimpleNamespace(id="job-1", metadata={}))
+    assert cancelled == [True]
+    assert "job-1" not in provider._live
+
+
+async def test_failed_cancel_keeps_job_available_for_retry():
+    class Proxy:
+        async def stop(self):
+            return None
+
+    def fail_cancel():
+        raise ConnectionError("cancel failed")
+
+    provider = HfSandboxProvider({})
+    provider._live["job-1"] = _Live(proxy=Proxy(), kill=fail_cancel)
+    with pytest.raises(ConnectionError, match="cancel failed"):
+        await provider.release(SimpleNamespace(id="job-1", metadata={}))
+    assert "job-1" in provider._live

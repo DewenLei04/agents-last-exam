@@ -1,6 +1,8 @@
 # openhands_cli — routed through the Hugging Face Inference Providers router
 # instead of OpenRouter. Any model id the router serves works here; swap
 # `model:` for another (e.g. Qwen/Qwen3.5-9B) to try a different one.
+# HF_INFERENCE_TOKEN must have only the Inference Providers call permission.
+# Keep the HF_TOKEN used for Jobs and task data on the orchestrator host.
 # Reference as:  agents: [ configs/agents/openhands_cli_hf.yaml ]
 
 harness: openhands_cli
@@ -9,4 +11,4 @@ model: zai-org/GLM-5.3
 config:
   provider: openrouter
   base_url: https://router.huggingface.co/v1
-  api_key: ${env:HF_TOKEN}
+  api_key: ${env:HF_INFERENCE_TOKEN}

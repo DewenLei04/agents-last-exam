@@ -14,32 +14,36 @@
     <h1>HF Sandboxes</h1>
     <p class="lede">
       Run the supported Ubuntu subset as one fresh Hugging Face Job per run
-      unit. Nothing runs locally — not even the orchestrator — so this is the
-      provider to reach for when you don't have (or don't want to use) local
+      unit. The orchestrator runs on your machine or CI runner, while the task
+      sandbox runs on HF. This is useful when you don't have local
       Docker, a cloud account, or GPU hardware of your own.
     </p>
 
     <div class="note">
       <div class="note-title">Supported Linux subset</div>
-      Same coverage as the <a href="/pages/local-docker.html">local Docker
-      provider</a> — both start the same
-      <code>agentslastexam/ale-ubuntu22-docker</code> image.
+      Uses the same image and CPU task list as the <a href="/pages/local-docker.html">local
+      Docker provider</a>. Tasks asking for more resources than the selected HF
+      flavor fail before a Job is created. With the shipped
+      <code>cpu-upgrade</code> flavor, 3 of the 99 listed tasks fail this check.
     </div>
 
     <h2>What runs where</h2>
     <p>
       The <code>hfsandbox</code> provider starts one HF Job per run unit from
       <code>agentslastexam/ale-ubuntu22-docker</code>, then talks to it over
-      the job's exposed port. The orchestrator process itself needs only an HF
-      token and outbound HTTPS — it can run on a laptop, a CI runner, or
-      another HF Job.
+      the job's exposed port. The orchestrator needs this repository, its Python
+      dependencies, an HF management token, and outbound HTTPS. It can run on a
+      laptop, a CI runner, or another HF Job.
     </p>
 
     <h2>Host requirements</h2>
     <ul>
-      <li>An HF token with the <code>jobs</code> scope (<code>hf auth login</code>, or <code>HF_TOKEN</code> in the environment).</li>
+      <li>A host HF token that can manage Jobs and access the gated dataset and private bucket (<code>hf auth login</code>, or <code>HF_TOKEN</code> in the environment).</li>
+      <li>A positive HF Jobs credit balance for paid runs.</li>
+      <li>A separate <code>HF_INFERENCE_TOKEN</code> with only permission to call HF Inference Providers for the agent.</li>
       <li>Approved access to the gated task-data dataset on Hugging Face.</li>
-      <li>A private HF bucket to hold the extracted task-data archive.</li>
+      <li>A private HF bucket containing input, software, and encrypted reference archives.</li>
+      <li>A separate private <code>ALE_MOUNTED_REFERENCE_ARCHIVE_PASSWORD</code> on the orchestrator host.</li>
     </ul>
     <pre><code>hf auth whoami
 uv sync --all-packages</code></pre>
@@ -48,34 +52,87 @@ uv sync --all-packages</code></pre>
     <p>
       The image ships without task inputs or references. Request access to the
       <a href="https://huggingface.co/datasets/agents-last-exam/agents-last-exam-data-archive">ALE
-      task-data archive</a>, then:
+      task-data archive</a>, prepare a private bucket with layout
+      <code>&lt;domain&gt;/&lt;task&gt;/&lt;variant&gt;/{input,software,reference.7z,reference.required}</code>
+      for variants with a reference, or <code>{input,software,reference.absent}</code>
+      for variants without one,
+      then mount it read-only. Encrypt each task's reference directory into
+      <code>reference.7z</code> before upload. Do not upload any plaintext
+      <code>reference/</code> directory: agents can browse the entire mount.
     </p>
-    <pre><code>hf download agents-last-exam/agents-last-exam-data-archive \
-  ale-tasks-data.tar.gz --repo-type dataset
-tar xzf ale-tasks-data.tar.gz -C task-data
-hf buckets create &lt;namespace&gt;/&lt;bucket&gt; --private
-hf buckets sync task-data hf://buckets/&lt;namespace&gt;/&lt;bucket&gt;</code></pre>
     <p>
-      That uploads the extracted
-      <code>&lt;domain&gt;/&lt;task&gt;/&lt;variant&gt;/{input,software,reference}</code>
-      tree to a bucket you own, ready to mount read-only into every sandbox job.
+      Use a new, randomly generated password stored only in the orchestrator's ignored
+      <code>secret/.env</code> (or its process environment) as
+      <code>ALE_MOUNTED_REFERENCE_ARCHIVE_PASSWORD</code>. The repository's
+      <code>secret/.env.example</code> contains a public
+      <code>ALE_REFERENCE_ARCHIVE_PASSWORD</code> for other task-data paths.
+      Do not reuse that value for this bucket. The preparation script reads
+      <code>ALE_MOUNTED_REFERENCE_ARCHIVE_PASSWORD</code> from its process
+      environment; ALE later loads the same value from <code>secret/.env</code>
+      when running the experiment. A wrong password fails evaluation.
+    </p>
+    <pre><code>export ALE_MOUNTED_REFERENCE_ARCHIVE_PASSWORD='your-new-private-password'
+hf download agents-last-exam/agents-last-exam-data-archive \
+  ale-tasks-data.tar.gz --repo-type dataset --local-dir ./ale-download
+mkdir -p ./task-data
+tar xzf ./ale-download/ale-tasks-data.tar.gz -C ./task-data
+uv run python scripts/prepare_hf_task_data.py ./task-data ./hf-ready-data
+hf buckets create &lt;your-namespace&gt;/&lt;new-private-bucket&gt; --private
+hf buckets sync ./hf-ready-data hf://buckets/&lt;your-namespace&gt;/&lt;new-private-bucket&gt; --dry-run
+hf buckets sync ./hf-ready-data hf://buckets/&lt;your-namespace&gt;/&lt;new-private-bucket&gt;</code></pre>
+    <p>
+      Run the preparation command on a trusted host with <code>7z</code>
+      installed. The destination must be new; the script rejects unexpected
+      files and symlinks. It writes <code>reference.required</code> alongside
+      each reference archive and <code>reference.absent</code> for variants
+      without one. A missing archive or marker then fails before the agent runs.
+      Put the same private password in <code>secret/.env</code> as
+      <code>ALE_MOUNTED_REFERENCE_ARCHIVE_PASSWORD=...</code> before running
+      the experiment. Upload into a new private bucket so older plaintext
+      reference files cannot remain alongside the encrypted archives. Keep the
+      password set on the orchestrator host for evaluation; never set it as an
+      HF Job secret or commit it to this repository.
+    </p>
+    <p>
+      Use agents with <code>executor: sandbox</code>. The orchestrator rejects
+      <code>local</code> and <code>docker</code> executors for encrypted mounted
+      data because they can access host files or the host process environment.
     </p>
 
     <h2>Use the shipped environment</h2>
     <p>
-      Point <code>volumes</code> at that bucket in
-      <code>configs/environments/hfsandbox.yaml</code>:
+      Point <code>volumes</code> at your own bucket in
+      <code>configs/environments/hfsandbox.yaml</code> before running:
     </p>
     <pre><code>volumes:
-  - hf://buckets/&lt;namespace&gt;/&lt;bucket&gt;:/mnt/ale-task-data:ro
+  - hf://buckets/&lt;your-namespace&gt;/&lt;your-bucket&gt;:/mnt/ale-task-data:ro
 task_data_source: mounted:/mnt/ale-task-data</code></pre>
     <p>
-      then run the premade example, which wires
-      <code>configs/agents/openhands_cli_hf.yaml</code> (GLM-5.3 via the HF
-      router) to this environment over
-      <code>selected_tasks/docker_support.txt</code>:
+      The premade <code>example_hfsandbox_exp.yaml</code> combines this
+      environment with <code>configs/agents/openhands_cli_hf.yaml</code>
+      (GLM-5.3 through the HF router) and
+      <code>selected_tasks/docker_support.txt</code>.
     </p>
-    <pre><code>uv run python -m ale_run run example_hfsandbox_exp.yaml</code></pre>
+    <p>
+      The orchestrator uses the token from <code>hf auth login</code> (or its
+      own <code>HF_TOKEN</code>) to manage Jobs and read task data. Create a
+      <a href="https://huggingface.co/settings/tokens">separate fine-grained token</a>
+      with only the "Make calls to Inference Providers" permission. Put it in
+      the ignored <code>secret/.env</code>
+      as <code>HF_INFERENCE_TOKEN=hf_...</code>, or export that variable before
+      running the example. Create <code>secret/.env</code> if it does not exist,
+      and add the private archive password there too. Keep using the management
+      token for <code>hf auth login</code>. The agent receives only the inference token;
+      keep <code>ALE_MOUNTED_REFERENCE_ARCHIVE_PASSWORD</code> on the
+      orchestrator host and never forward it to a sandbox Job.
+    </p>
+    <pre><code>uv run python -m ale_run run example_hfsandbox_exp.yaml --dry-run
+uv run python -m ale_run run example_hfsandbox_exp.yaml</code></pre>
+    <p>
+      <code>--dry-run</code> only lists the task matrix. It does not check token
+      permissions, bucket contents, or whether each task fits the selected
+      hardware, and it does not start a paid Job.
+    </p>
     <p>
       For data-less tasks only (<code>demo</code>, <code>tool_smoke</code>) you
       can drop <code>volumes</code> and use
@@ -84,11 +141,39 @@ task_data_source: mounted:/mnt/ale-task-data</code></pre>
 
     <h2>Resource sizing</h2>
     <p>
-      Set <code>flavor</code> to any value <code>hf jobs hardware</code>
-      lists (default <code>cpu-upgrade</code>, 8 vCPU / 32 GB). A cold pull of
-      the ~40 GB image can take 10-15 minutes — <code>start_timeout</code>
-      accounts for that. <code>idle_timeout</code> self-terminates a sandbox
-      that goes quiet, and <code>job_timeout</code> is the hard per-job cap.
+      The provider uses a startup wrapper because the currently published ALE
+      image binds cua-server to loopback. The wrapper changes
+      the entrypoint at Job startup to bind <code>0.0.0.0</code>. It also accepts
+      a rebuilt image whose entrypoint already has that setting.
+    </p>
+    <p>
+      Set <code>flavor</code> to <code>cpu-basic</code>, <code>cpu-upgrade</code>,
+      <code>cpu-xl</code>, or <code>cpu-performance</code> (default
+      <code>cpu-upgrade</code>, 8 vCPU / 32 GB). Some tasks in
+      <code>docker_support.txt</code> require 16 vCPU / 60 GB. With the shipped
+      <code>cpu-upgrade</code> flavor, those 3 tasks fail before Job creation.
+      Set <code>flavor: cpu-xl</code> to run the full 99-task list, or remove
+      those 3 tasks from a copy of the list to keep the cheaper default.
+      Check <a href="https://huggingface.co/docs/hub/jobs-pricing">current Jobs pricing</a>
+      before choosing a larger flavor; the exposed port is billed separately.
+      A cold pull of
+      the ~40 GB image can take 10-15 minutes; <code>start_timeout</code>
+      accounts for that. <code>idle_timeout</code> applies only to
+      <code>transport: sandbox</code>; <code>job_timeout</code> is the hard
+      per-job cap for the default transport.
+    </p>
+    <p>
+      For a short connection check with another image, set <code>image_ref</code>
+      and a list-valued <code>job_command</code>. The command must start a CUA
+      server on the selected image's declared port and bind to
+      <code>0.0.0.0</code>; otherwise the exposed Job port cannot reach it.
+      Omit <code>job_command</code> to run the image's usual entrypoint.
+      A connection check does not validate task software or scoring.
+    </p>
+    <pre><code>uv run python scripts/smoke_hf_provider.py</code></pre>
+    <p>
+      This bounded check uses a pinned AMD64 CUA image, verifies the provider's
+      CUA command path, and cancels its Job. It does not use task data or an agent.
     </p>
 
     <h2>Output options</h2>
@@ -102,7 +187,8 @@ task_data_source: mounted:/mnt/ale-task-data</code></pre>
     <h2>Current limits</h2>
     <ul>
       <li>Linux tasks only, same subset as the local Docker provider.</li>
-      <li>The sandbox shares the job container's kernel and is not VM-isolated.</li>
+      <li>The Job runs in a container that shares the host kernel; it is not VM-isolated.</li>
+      <li>Reference archives prevent direct plaintext access during the agent phase, but grading still runs in the same container. An agent that leaves a background process may observe evaluation-time decryption. Use a separate trusted evaluator for strict anti-leak guarantees.</li>
       <li><code>transport: sandbox</code> (the HF Sandbox API port-proxy) is available but not the default — prefer <code>transport: job</code>.</li>
     </ul>
 
